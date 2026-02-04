@@ -1,0 +1,30 @@
+# Funkwhale deployment variables
+# Copy this file to all.yml and edit the values
+
+# Required: your domain name
+funkwhale_hostname: your-domain.example.com
+
+# Required: email for Let's Encrypt certificate
+certbot_email: you@example.com
+
+# Funkwhale version to deploy
+funkwhale_version: "2.0.0-rc15"
+
+# Application settings
+funkwhale_api_port: 5000
+funkwhale_api_ip: "127.0.0.1"
+funkwhale_web_workers: 4
+funkwhale_protocol: https
+celery_concurrency: 0
+nginx_max_body_size: "2000M"
+
+# Paths (defaults match standard Funkwhale layout)
+funkwhale_dir: /srv/funkwhale
+funkwhale_data_dir: /srv/funkwhale/data
+
+# Database
+funkwhale_db_name: funkwhale
+funkwhale_db_user: funkwhale
+
+# Set to true for initial deployment, false for upgrades
+funkwhale_fresh_install: true

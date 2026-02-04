@@ -1,0 +1,23 @@
+# Secrets
+.env
+*.secret
+*.key
+
+# Ansible
+*.retry
+ansible/inventory
+ansible/group_vars/all.yml
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Backups
+*.sql
+*.bak

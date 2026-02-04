@@ -1,0 +1,12 @@
+# Logrotate configuration for Funkwhale
+# Place in /etc/logrotate.d/funkwhale
+
+/var/log/funkwhale/*.log {
+    weekly
+    rotate 4
+    size 10M
+    missingok
+    notifempty
+    compress
+    delaycompress
+}

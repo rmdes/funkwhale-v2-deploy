@@ -1,0 +1,7 @@
+---
+- name: Deploy Funkwhale v2
+  hosts: funkwhale
+  become: true
+
+  roles:
+    - funkwhale

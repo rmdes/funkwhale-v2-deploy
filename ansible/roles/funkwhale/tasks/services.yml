@@ -1,0 +1,34 @@
+---
+- name: Deploy systemd target
+  copy:
+    src: "{{ role_path }}/../../../config/systemd/funkwhale.target"
+    dest: /etc/systemd/system/funkwhale.target
+  notify: reload systemd
+
+- name: Deploy systemd service units
+  copy:
+    src: "{{ role_path }}/../../../config/systemd/{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+  loop:
+    - funkwhale-server.service
+    - funkwhale-worker.service
+    - funkwhale-beat.service
+  notify:
+    - reload systemd
+    - restart funkwhale
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: Enable and start Funkwhale
+  systemd:
+    name: funkwhale.target
+    state: started
+    enabled: yes
+
+- name: Ensure nginx is running
+  systemd:
+    name: nginx
+    state: started
+    enabled: yes

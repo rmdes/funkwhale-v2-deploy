@@ -1,0 +1,21 @@
+[Unit]
+Description=Funkwhale application server
+After=redis.service postgresql.service
+PartOf=funkwhale.target
+
+[Service]
+User=funkwhale
+WorkingDirectory=/srv/funkwhale/api
+EnvironmentFile=/srv/funkwhale/config/.env
+
+Type=notify
+KillMode=mixed
+ExecStart=/srv/funkwhale/venv/bin/gunicorn \
+    config.asgi:application \
+    --workers ${FUNKWHALE_WEB_WORKERS} \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind ${FUNKWHALE_API_IP}:${FUNKWHALE_API_PORT}
+ExecReload=/bin/kill -s HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target

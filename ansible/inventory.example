@@ -1,0 +1,2 @@
+[funkwhale]
+your-server.example.com ansible_user=root

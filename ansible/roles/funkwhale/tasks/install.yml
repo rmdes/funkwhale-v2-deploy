@@ -1,0 +1,87 @@
+---
+- name: Create funkwhale system user
+  user:
+    name: funkwhale
+    system: yes
+    home: "{{ funkwhale_dir }}"
+    shell: /bin/bash
+    create_home: yes
+
+- name: Create Funkwhale directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: funkwhale
+    group: funkwhale
+  loop:
+    - "{{ funkwhale_dir }}"
+    - "{{ funkwhale_dir }}/config"
+    - "{{ funkwhale_dir }}/api"
+    - "{{ funkwhale_dir }}/front"
+    - "{{ funkwhale_data_dir }}"
+    - "{{ funkwhale_data_dir }}/media"
+    - "{{ funkwhale_data_dir }}/music"
+    - "{{ funkwhale_data_dir }}/static"
+
+- name: Download Funkwhale API
+  get_url:
+    url: "https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts/{{ funkwhale_version }}/download?job=build_api"
+    dest: "{{ funkwhale_dir }}/api-{{ funkwhale_version }}.zip"
+
+- name: Download Funkwhale frontend
+  get_url:
+    url: "https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts/{{ funkwhale_version }}/download?job=build_front"
+    dest: "{{ funkwhale_dir }}/front-{{ funkwhale_version }}.zip"
+
+- name: Extract API
+  unarchive:
+    src: "{{ funkwhale_dir }}/api-{{ funkwhale_version }}.zip"
+    dest: "{{ funkwhale_dir }}"
+    remote_src: yes
+    owner: funkwhale
+    group: funkwhale
+
+- name: Extract frontend
+  unarchive:
+    src: "{{ funkwhale_dir }}/front-{{ funkwhale_version }}.zip"
+    dest: "{{ funkwhale_dir }}"
+    remote_src: yes
+    owner: funkwhale
+    group: funkwhale
+
+- name: Clean up download archives
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ funkwhale_dir }}/api-{{ funkwhale_version }}.zip"
+    - "{{ funkwhale_dir }}/front-{{ funkwhale_version }}.zip"
+
+- name: Create Python virtual environment
+  command: python3 -m venv {{ funkwhale_dir }}/venv
+  args:
+    creates: "{{ funkwhale_dir }}/venv/bin/python"
+  become_user: funkwhale
+
+- name: Upgrade pip and wheel
+  pip:
+    name:
+      - pip
+      - wheel
+    state: latest
+    virtualenv: "{{ funkwhale_dir }}/venv"
+  become_user: funkwhale
+
+- name: Install Funkwhale API package
+  pip:
+    name: "{{ funkwhale_dir }}/api"
+    editable: yes
+    virtualenv: "{{ funkwhale_dir }}/venv"
+  become_user: funkwhale
+
+- name: Set ownership on venv
+  file:
+    path: "{{ funkwhale_dir }}/venv"
+    owner: funkwhale
+    group: funkwhale
+    recurse: yes

@@ -1,0 +1,15 @@
+---
+- name: Create Funkwhale PostgreSQL user
+  become_user: postgres
+  community.postgresql.postgresql_user:
+    name: "{{ funkwhale_db_user }}"
+    role_attr_flags: CREATEDB
+    state: present
+
+- name: Create Funkwhale database
+  become_user: postgres
+  community.postgresql.postgresql_db:
+    name: "{{ funkwhale_db_name }}"
+    owner: "{{ funkwhale_db_user }}"
+    encoding: UTF-8
+    state: present

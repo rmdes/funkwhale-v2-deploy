@@ -1,0 +1,15 @@
+---
+- name: Install system dependencies
+  import_tasks: dependencies.yml
+
+- name: Set up PostgreSQL database
+  import_tasks: database.yml
+
+- name: Install Funkwhale
+  import_tasks: install.yml
+
+- name: Configure Funkwhale
+  import_tasks: config.yml
+
+- name: Set up services
+  import_tasks: services.yml

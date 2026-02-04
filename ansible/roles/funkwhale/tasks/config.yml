@@ -1,0 +1,81 @@
+---
+- name: Generate Django secret key
+  command: python3 -c "import secrets; print(secrets.token_hex(32))"
+  register: django_secret_key
+  when: funkwhale_fresh_install
+  changed_when: false
+
+- name: Deploy Funkwhale .env configuration
+  template:
+    src: env.j2
+    dest: "{{ funkwhale_dir }}/config/.env"
+    owner: funkwhale
+    group: funkwhale
+    mode: "0600"
+  notify: restart funkwhale
+
+- name: Deploy nginx proxy config
+  template:
+    src: funkwhale_proxy.conf.j2
+    dest: /etc/nginx/funkwhale_proxy.conf
+  notify: reload nginx
+
+- name: Deploy nginx site config
+  template:
+    src: funkwhale_nginx.conf.j2
+    dest: "/etc/nginx/sites-available/{{ funkwhale_hostname }}.conf"
+    owner: root
+    group: root
+  notify: reload nginx
+
+- name: Enable nginx site
+  file:
+    src: "/etc/nginx/sites-available/{{ funkwhale_hostname }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ funkwhale_hostname }}.conf"
+    state: link
+  notify: reload nginx
+
+- name: Obtain SSL certificate
+  command: >
+    certbot -n certonly --nginx
+    -m {{ certbot_email }}
+    --agree-tos
+    -d {{ funkwhale_hostname }}
+  args:
+    creates: "/etc/letsencrypt/live/{{ funkwhale_hostname }}/fullchain.pem"
+
+- name: Set up certbot renewal cron
+  cron:
+    name: "funkwhale_letsencrypt_renewal"
+    special_time: weekly
+    job: "/usr/bin/certbot -n certonly --nginx -m {{ certbot_email }} --agree-tos -d {{ funkwhale_hostname }}"
+
+- name: Deploy logrotate config
+  template:
+    src: logrotate.j2
+    dest: /etc/logrotate.d/funkwhale
+
+- name: Collect static files
+  command: "{{ funkwhale_dir }}/venv/bin/funkwhale-manage collectstatic --no-input"
+  become_user: funkwhale
+  args:
+    chdir: "{{ funkwhale_dir }}"
+  changed_when: false
+
+- name: Run database migrations
+  command: "{{ funkwhale_dir }}/venv/bin/funkwhale-manage migrate"
+  become_user: funkwhale
+  args:
+    chdir: "{{ funkwhale_dir }}"
+  register: migrate_output
+  changed_when: "'No migrations to apply' not in migrate_output.stdout"
+
+- name: Create superuser
+  command: >
+    {{ funkwhale_dir }}/venv/bin/funkwhale-manage createsuperuser
+    --noinput --username admin --email {{ certbot_email }}
+  become_user: funkwhale
+  args:
+    chdir: "{{ funkwhale_dir }}"
+  when: funkwhale_fresh_install
+  ignore_errors: yes

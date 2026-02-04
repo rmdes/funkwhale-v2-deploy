@@ -1,0 +1,39 @@
+---
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install system packages
+  apt:
+    name:
+      - python3
+      - python3-venv
+      - python3-pip
+      - python3-dev
+      - libpq-dev
+      - libldap2-dev
+      - libsasl2-dev
+      - build-essential
+      - postgresql
+      - postgresql-contrib
+      - redis-server
+      - nginx
+      - certbot
+      - python3-certbot-nginx
+      - unzip
+      - curl
+      - git
+    state: present
+
+- name: Ensure PostgreSQL is running
+  systemd:
+    name: postgresql
+    state: started
+    enabled: yes
+
+- name: Ensure Redis is running
+  systemd:
+    name: redis-server
+    state: started
+    enabled: yes
