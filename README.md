@@ -106,31 +106,54 @@ ansible-playbook -i inventory playbook.yml
 | `funkwhale_api_port` | `5000` | API listening port |
 | `funkwhale_fresh_install` | `true` | Set to `false` for upgrades |
 
-## Upgrading
+## Migrating from Funkwhale 1.x
 
-For upgrades between v2 releases, use the upgrade script:
+If you're upgrading from Funkwhale 1.4.x to v2, use the migration script:
 
 ```bash
-# Check current status
-sudo bash scripts/upgrade.sh status
+# Check current installation
+sudo bash scripts/migrate-v1-to-v2.sh status
 
-# Back up database first
-sudo -u postgres pg_dump funkwhale > backup-$(date +%Y%m%d).sql
-
-# Stop services and upgrade
+# Stop services first
 sudo systemctl stop funkwhale.target
-sudo bash scripts/upgrade.sh upgrade 2.0.0-rc15
+
+# Run the migration (backs up everything, then upgrades)
+sudo bash scripts/migrate-v1-to-v2.sh upgrade
 
 # If something goes wrong
-sudo bash scripts/upgrade.sh rollback
+sudo bash scripts/migrate-v1-to-v2.sh rollback
 ```
 
-The upgrade script will:
-1. Back up current API, frontend, venv, config, systemd units, and nginx config
-2. Download and install the new version
-3. Update systemd units and nginx proxy config
-4. Run database migrations
-5. Start services
+This handles the full v1→v2 transition: backing up the old `virtualenv`, creating a new `venv`, downloading v2 artifacts, updating systemd units and nginx config, and running database migrations.
+
+## Upgrading between v2 releases
+
+For ongoing upgrades (e.g., between release candidates), use the updater:
+
+```bash
+# Check for available updates
+./scripts/funkwhale-updater.sh check
+
+# Upgrade to latest version
+./scripts/funkwhale-updater.sh upgrade
+
+# Upgrade to a specific version (with database backup)
+./scripts/funkwhale-updater.sh upgrade 2.0.0-rc15 --with-db
+
+# If something goes wrong
+./scripts/funkwhale-updater.sh rollback
+```
+
+The updater queries the Funkwhale GitLab API for available versions and handles the full lifecycle: stop → backup → download → install → migrate → start → verify.
+
+You can also use the simpler upgrade script:
+
+```bash
+sudo bash scripts/upgrade.sh status
+sudo systemctl stop funkwhale.target
+sudo bash scripts/upgrade.sh upgrade 2.0.0-rc15
+sudo bash scripts/upgrade.sh rollback  # if needed
+```
 
 ## Architecture
 
