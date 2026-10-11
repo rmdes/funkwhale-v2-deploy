@@ -1,0 +1,19 @@
+{
+	email {$LETSENCRYPT_EMAIL}
+}
+
+{$FUNKWHALE_HOSTNAME} {
+	header Strict-Transport-Security "max-age=31536000"
+
+	# Django static files (admin pages); the front container doesn't serve these
+	handle_path /staticfiles/* {
+		root * /srv/funkwhale/static
+		file_server
+	}
+
+	# Everything else goes to the front container, which proxies the API.
+	# Caddy sets X-Forwarded-Proto/Host/For, which the front container passes on.
+	handle {
+		reverse_proxy front:80
+	}
+}

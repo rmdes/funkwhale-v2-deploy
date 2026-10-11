@@ -1,0 +1,91 @@
+# Funkwhale v2 with Docker Compose.
+# Don't edit .env by hand to start: run ./funkwhale.sh init, which generates it.
+#
+# Data lives in ./data (database, media, music, static files, TLS certificates).
+
+x-funkwhale-api: &funkwhale-api
+  image: funkwhale/api:${FUNKWHALE_VERSION:?run ./funkwhale.sh init first}
+  env_file: .env
+  restart: unless-stopped
+  volumes:
+    - ./data/media:/srv/funkwhale/data/media
+    - ./data/static:/srv/funkwhale/data/static
+    - ./data/music:/music:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: funkwhale
+      POSTGRES_DB: funkwhale
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./funkwhale.sh init first}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "funkwhale", "-d", "funkwhale"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    <<: *funkwhale-api
+    command: gunicorn
+
+  celeryworker:
+    <<: *funkwhale-api
+    command: celery --app funkwhale_api.taskapp worker --loglevel INFO --concurrency ${CELERYD_CONCURRENCY:-0}
+
+  celerybeat:
+    <<: *funkwhale-api
+    command: celery --app funkwhale_api.taskapp beat --loglevel INFO --schedule /tmp/celerybeat-schedule
+
+  # nginx serving the web app and proxying the API
+  front:
+    image: funkwhale/front:${FUNKWHALE_VERSION:?run ./funkwhale.sh init first}
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      - api
+    volumes:
+      - ./data/media:/srv/funkwhale/data/media:ro
+      - ./data/music:/music:ro
+    # Only reachable from this host; point your own reverse proxy here when not using Caddy
+    ports:
+      - "${FUNKWHALE_HTTP_BIND:-127.0.0.1:8080}:80"
+
+  # TLS termination with automatic Let's Encrypt certificates.
+  # Enabled by COMPOSE_PROFILES=caddy in .env (the default; init --no-tls leaves it out).
+  caddy:
+    image: caddy:2.10-alpine
+    profiles: ["caddy"]
+    restart: unless-stopped
+    depends_on:
+      - front
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+      - "${CADDY_HTTPS_PORT:-443}:443/udp"
+    environment:
+      FUNKWHALE_HOSTNAME: ${FUNKWHALE_HOSTNAME}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/static:/srv/funkwhale/static:ro
+      - ./data/caddy:/data
