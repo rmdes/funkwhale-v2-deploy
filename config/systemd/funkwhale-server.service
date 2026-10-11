@@ -10,6 +10,8 @@ EnvironmentFile=/srv/funkwhale/config/.env
 
 Type=notify
 KillMode=mixed
+Restart=on-failure
+RestartSec=5
 ExecStart=/srv/funkwhale/venv/bin/gunicorn \
     config.asgi:application \
     --workers ${FUNKWHALE_WEB_WORKERS} \

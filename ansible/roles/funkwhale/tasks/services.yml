@@ -1,15 +1,11 @@
 ---
-- name: Deploy systemd target
+# Units come from config/systemd so manual and Ansible installs share one copy
+- name: Deploy systemd units
   copy:
-    src: "{{ role_path }}/../../../config/systemd/funkwhale.target"
-    dest: /etc/systemd/system/funkwhale.target
-  notify: reload systemd
-
-- name: Deploy systemd service units
-  copy:
-    src: "{{ role_path }}/../../../config/systemd/{{ item }}"
+    content: "{{ lookup('file', role_path ~ '/../../../config/systemd/' ~ item) | replace('/srv/funkwhale', funkwhale_dir) }}\n"
     dest: "/etc/systemd/system/{{ item }}"
   loop:
+    - funkwhale.target
     - funkwhale-server.service
     - funkwhale-worker.service
     - funkwhale-beat.service

@@ -1,5 +1,7 @@
 # Funkwhale deployment variables
-# Copy this file to all.yml and edit the values
+# Copy this file to all.yml and edit the values.
+# Everything except the two required values has a default in
+# roles/funkwhale/defaults/main.yml.
 
 # Required: your domain name
 funkwhale_hostname: your-domain.example.com
@@ -26,5 +28,10 @@ funkwhale_data_dir: /srv/funkwhale/data
 funkwhale_db_name: funkwhale
 funkwhale_db_user: funkwhale
 
-# Set to true for initial deployment, false for upgrades
+# Admin account, created when funkwhale_fresh_install is true.
+# Re-running with an existing admin is harmless.
 funkwhale_fresh_install: true
+funkwhale_admin_username: admin
+# Leave empty to set the password later with: funkwhale-manage changepassword admin
+# Better: keep it in an ansible-vault file rather than here.
+funkwhale_admin_password: ""

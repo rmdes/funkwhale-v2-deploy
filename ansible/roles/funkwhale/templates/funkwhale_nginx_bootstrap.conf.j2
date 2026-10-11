@@ -1,0 +1,12 @@
+# Temporary HTTP-only site used to obtain the first TLS certificate.
+# Replaced by the full Funkwhale site config once the certificate exists.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ funkwhale_hostname }};
+
+    location / {
+        return 404;
+    }
+}

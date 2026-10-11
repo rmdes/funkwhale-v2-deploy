@@ -1,9 +1,28 @@
 ---
+# Keep the existing secret key across runs; only generate one on first deploy
+- name: Read existing Django secret key
+  command: sed -n 's/^DJANGO_SECRET_KEY=//p' "{{ funkwhale_dir }}/config/.env"
+  register: existing_secret_key
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
 - name: Generate Django secret key
   command: python3 -c "import secrets; print(secrets.token_hex(32))"
-  register: django_secret_key
-  when: funkwhale_fresh_install
+  register: generated_secret_key
+  when: existing_secret_key.stdout | default('') | length == 0
   changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Set Django secret key
+  set_fact:
+    funkwhale_django_secret_key: >-
+      {{ existing_secret_key.stdout
+         if existing_secret_key.stdout | default('') | length > 0
+         else generated_secret_key.stdout }}
+  no_log: true
 
 - name: Deploy Funkwhale .env configuration
   template:
@@ -20,6 +39,43 @@
     dest: /etc/nginx/funkwhale_proxy.conf
   notify: reload nginx
 
+# The full site config references the certificate, so nginx can't load it until
+# the certificate exists. On first deploy, serve an HTTP-only site to pass the challenge.
+- name: Check for an existing TLS certificate
+  stat:
+    path: "/etc/letsencrypt/live/{{ funkwhale_hostname }}/fullchain.pem"
+  register: funkwhale_cert
+
+- name: Obtain TLS certificate
+  when: not funkwhale_cert.stat.exists
+  block:
+    - name: Deploy HTTP-only nginx site for the certificate challenge
+      template:
+        src: funkwhale_nginx_bootstrap.conf.j2
+        dest: "/etc/nginx/sites-available/{{ funkwhale_hostname }}.conf"
+        owner: root
+        group: root
+
+    - name: Enable nginx site
+      file:
+        src: "/etc/nginx/sites-available/{{ funkwhale_hostname }}.conf"
+        dest: "/etc/nginx/sites-enabled/{{ funkwhale_hostname }}.conf"
+        state: link
+
+    - name: Reload nginx with the HTTP-only site
+      systemd:
+        name: nginx
+        state: reloaded
+
+    - name: Obtain SSL certificate
+      command: >
+        certbot -n certonly --nginx
+        -m {{ certbot_email }}
+        --agree-tos
+        -d {{ funkwhale_hostname }}
+      args:
+        creates: "/etc/letsencrypt/live/{{ funkwhale_hostname }}/fullchain.pem"
+
 - name: Deploy nginx site config
   template:
     src: funkwhale_nginx.conf.j2
@@ -35,47 +91,77 @@
     state: link
   notify: reload nginx
 
-- name: Obtain SSL certificate
-  command: >
-    certbot -n certonly --nginx
-    -m {{ certbot_email }}
-    --agree-tos
-    -d {{ funkwhale_hostname }}
-  args:
-    creates: "/etc/letsencrypt/live/{{ funkwhale_hostname }}/fullchain.pem"
+# Renewal is handled by the certbot.timer shipped with the certbot package
+- name: Ensure certbot renewal timer is enabled
+  systemd:
+    name: certbot.timer
+    state: started
+    enabled: yes
 
-- name: Set up certbot renewal cron
+- name: Create certbot deploy hook directory
+  file:
+    path: /etc/letsencrypt/renewal-hooks/deploy
+    state: directory
+
+- name: Reload nginx after certificate renewal
+  copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+    mode: "0755"
+    content: |
+      #!/bin/sh
+      systemctl reload nginx
+
+- name: Check for crontab
+  stat:
+    path: /usr/bin/crontab
+  register: crontab_bin
+
+- name: Remove certbot cron job created by earlier versions of this role
   cron:
     name: "funkwhale_letsencrypt_renewal"
-    special_time: weekly
-    job: "/usr/bin/certbot -n certonly --nginx -m {{ certbot_email }} --agree-tos -d {{ funkwhale_hostname }}"
+    state: absent
+  when: crontab_bin.stat.exists
 
-- name: Deploy logrotate config
-  template:
-    src: logrotate.j2
-    dest: /etc/logrotate.d/funkwhale
+# Services log to journald; this file never matched anything
+- name: Remove unused logrotate config from earlier versions of this role
+  file:
+    path: /etc/logrotate.d/funkwhale
+    state: absent
 
 - name: Collect static files
   command: "{{ funkwhale_dir }}/venv/bin/funkwhale-manage collectstatic --no-input"
   become_user: funkwhale
   args:
-    chdir: "{{ funkwhale_dir }}"
+    chdir: "{{ funkwhale_dir }}/api"
   changed_when: false
 
 - name: Run database migrations
   command: "{{ funkwhale_dir }}/venv/bin/funkwhale-manage migrate"
   become_user: funkwhale
   args:
-    chdir: "{{ funkwhale_dir }}"
+    chdir: "{{ funkwhale_dir }}/api"
   register: migrate_output
   changed_when: "'No migrations to apply' not in migrate_output.stdout"
 
-- name: Create superuser
+- name: Create admin user
   command: >
     {{ funkwhale_dir }}/venv/bin/funkwhale-manage createsuperuser
-    --noinput --username admin --email {{ certbot_email }}
+    --noinput --username {{ funkwhale_admin_username }} --email {{ funkwhale_admin_email }}
   become_user: funkwhale
   args:
-    chdir: "{{ funkwhale_dir }}"
+    chdir: "{{ funkwhale_dir }}/api"
+  environment: "{{ {'DJANGO_SUPERUSER_PASSWORD': funkwhale_admin_password} if funkwhale_admin_password else {} }}"
+  register: createsuperuser
+  changed_when: createsuperuser.rc == 0
+  failed_when: createsuperuser.rc != 0 and 'already taken' not in createsuperuser.stderr
   when: funkwhale_fresh_install
-  ignore_errors: yes
+
+- name: Remind to set the admin password
+  debug:
+    msg: >-
+      Admin user '{{ funkwhale_admin_username }}' was created without a password. Set one with:
+      sudo -u funkwhale {{ funkwhale_dir }}/venv/bin/funkwhale-manage changepassword {{ funkwhale_admin_username }}
+  when:
+    - funkwhale_fresh_install
+    - createsuperuser is changed
+    - not funkwhale_admin_password

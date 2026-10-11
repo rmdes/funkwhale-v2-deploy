@@ -1,4 +1,11 @@
 ---
+- name: Check required variables
+  assert:
+    that:
+      - funkwhale_hostname is defined and funkwhale_hostname | length > 0
+      - certbot_email is defined and certbot_email | length > 0
+    fail_msg: "Set funkwhale_hostname and certbot_email (see group_vars/all.yml.example)"
+
 - name: Install system dependencies
   import_tasks: dependencies.yml
 

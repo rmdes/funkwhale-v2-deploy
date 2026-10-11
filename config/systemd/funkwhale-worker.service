@@ -9,6 +9,8 @@ WorkingDirectory=/srv/funkwhale/api
 Environment="CELERYD_CONCURRENCY=0"
 EnvironmentFile=/srv/funkwhale/config/.env
 
+Restart=on-failure
+RestartSec=5
 ExecStart=/srv/funkwhale/venv/bin/celery \
     --app funkwhale_api.taskapp \
     worker \

@@ -3,25 +3,30 @@
 # Funkwhale Updater - Check for new releases and upgrade
 #
 # Usage:
-#   ./funkwhale-updater.sh check                - Check for new versions
-#   ./funkwhale-updater.sh upgrade              - Upgrade to latest RC
-#   ./funkwhale-updater.sh upgrade --with-db    - Upgrade with database backup
-#   ./funkwhale-updater.sh upgrade <version>    - Upgrade to specific version
-#   ./funkwhale-updater.sh rollback             - Rollback to previous version
-#   ./funkwhale-updater.sh status               - Show current installation
+#   ./funkwhale-updater.sh check                          - Check for new versions
+#   ./funkwhale-updater.sh upgrade [<version>] [--with-db] - Upgrade (default: latest)
+#   ./funkwhale-updater.sh rollback                       - Rollback to previous version
+#   ./funkwhale-updater.sh status                         - Show current installation
+#
+# Runs on the Funkwhale host itself (with sudo), or from another machine
+# over SSH when SSH_HOST is set.
 #
 
 set -e
 
 # ============== CONFIGURATION ==============
-FUNKWHALE_DIR="/srv/funkwhale"
-BACKUP_BASE="/srv/funkwhale/backups"
-GITLAB_API="https://dev.funkwhale.audio/api/v4/projects/funkwhale%2Ffunkwhale"
+FUNKWHALE_DIR="${FUNKWHALE_DIR:-/srv/funkwhale}"
+BACKUP_BASE="$FUNKWHALE_DIR/backups"
+GITLAB_API="${GITLAB_API:-https://dev.funkwhale.audio/api/v4/projects/funkwhale%2Ffunkwhale}"
+ARTIFACTS_URL="${ARTIFACTS_URL:-https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts}"
 ROLLBACK_MARKER="$BACKUP_BASE/.rollback_info"
 VERSION_MARKER="$FUNKWHALE_DIR/.installed_version"
+STAGING_DIR="$FUNKWHALE_DIR/.upgrade-staging"
+DB_NAME="${DB_NAME:-funkwhale}"
+KEEP_BACKUPS="${KEEP_BACKUPS:-3}"
 
 # Set to your server's SSH alias/hostname, or leave empty to run locally
-SSH_HOST=""
+SSH_HOST="${SSH_HOST:-}"
 
 # Colors
 RED='\033[0;31m'
@@ -31,6 +36,9 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+BACKUP_DIR=""
+CHANGES_STARTED=false
+
 # ============== HELPER FUNCTIONS ==============
 
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -38,68 +46,84 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} $1"; }
 
-# Check if running locally or need SSH
+# Run a shell snippet on the Funkwhale host: locally, or over SSH.
+# Snippets are built locally, so client-side expansion is intended.
+# shellcheck disable=SC2029
 run_cmd() {
     if [[ -n "$SSH_HOST" ]]; then
-        ssh "$SSH_HOST" "$@"
+        ssh "$SSH_HOST" "$1"
     else
-        eval "$@"
+        bash -c "$1"
     fi
 }
 
+# Run a shell snippet as root. The whole snippet, redirects included, runs under root's shell.
+# shellcheck disable=SC2029
 run_cmd_sudo() {
     if [[ -n "$SSH_HOST" ]]; then
-        ssh "$SSH_HOST" "sudo $*"
+        ssh "$SSH_HOST" "sudo bash -c $(printf '%q' "$1")"
     else
-        sudo "$@"
+        sudo bash -c "$1"
     fi
+}
+
+journal_hint() {
+    echo "${SSH_HOST:+ssh $SSH_HOST }sudo journalctl -u funkwhale-server -n 50"
 }
 
 # ============== VERSION FUNCTIONS ==============
 
+# pip reports 2.0.0rc15, release tags are 2.0.0-rc15
+normalize_version() {
+    sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)(a|b|rc)([0-9]+)$/\1-\2\3/'
+}
+
 get_installed_version() {
     local version
     # First check our version marker file (set after successful upgrade)
-    version=$(run_cmd "cat $VERSION_MARKER 2>/dev/null" 2>/dev/null || echo "")
+    version=$(run_cmd "cat $VERSION_MARKER 2>/dev/null" 2>/dev/null || true)
 
     if [[ -n "$version" ]]; then
         echo "$version"
         return
     fi
 
-    # Fall back to pip version (won't distinguish between RCs)
-    version=$(run_cmd "$FUNKWHALE_DIR/venv/bin/pip show funkwhale-api 2>/dev/null | grep '^Version:' | awk '{print \$2}'" 2>/dev/null || echo "unknown")
-    echo "$version"
+    # Fall back to pip version
+    version=$(run_cmd "$FUNKWHALE_DIR/venv/bin/pip show funkwhale-api 2>/dev/null | awk '/^Version:/ {print \$2}'" 2>/dev/null || true)
+    echo "${version:-unknown}" | normalize_version
 }
 
-get_available_versions() {
-    # Fetch tags from GitLab API
-    curl -s "${GITLAB_API}/repository/tags?per_page=20" | \
-        jq -r '.[].name' 2>/dev/null | \
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | \
-        head -15
+# Print release tags (X.Y.Z and X.Y.Z-suffix) from GitLab, one per line
+fetch_tags() {
+    local json
+    json=$(curl -fsS --max-time 30 "${GITLAB_API}/repository/tags?per_page=100") || return 1
+    jq -r '.[].name' <<<"$json" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || true
 }
 
-get_latest_version() {
-    # Get the latest RC or stable version
-    local filter="${1:-rc}"  # "rc" for release candidates, "stable" for stable only
-
-    if [[ "$filter" == "stable" ]]; then
-        curl -s "${GITLAB_API}/repository/tags?per_page=50" | \
-            jq -r '.[].name' 2>/dev/null | \
-            grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | \
-            head -1
-    else
-        curl -s "${GITLAB_API}/repository/tags?per_page=20" | \
-            jq -r '.[].name' 2>/dev/null | \
-            grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | \
-            head -1
-    fi
+# Sort versions ascending; a pre-release (2.0.0-rc15) sorts below its release (2.0.0)
+sort_versions() {
+    sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1.1 \1/; s/^([0-9]+\.[0-9]+\.[0-9]+)-(.+)$/\1.0-\2 \1-\2/' |
+        sort -k1,1V | cut -d' ' -f2
 }
 
 version_gt() {
-    # Compare versions: returns 0 if $1 > $2
-    test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"
+    # Returns 0 if $1 > $2
+    [[ "$1" != "$2" && "$(printf '%s\n' "$1" "$2" | sort_versions | tail -n 1)" == "$1" ]]
+}
+
+load_tags() {
+    if ! TAGS=$(fetch_tags) || [[ -z "$TAGS" ]]; then
+        log_error "Could not fetch release tags from $GITLAB_API"
+        exit 1
+    fi
+}
+
+latest_version() {
+    sort_versions <<<"$TAGS" | tail -n 1
+}
+
+latest_stable_version() {
+    grep -v -- - <<<"$TAGS" | sort_versions | tail -n 1
 }
 
 # ============== CHECK COMMAND ==============
@@ -117,20 +141,20 @@ do_check() {
     echo -e "  Installed: ${CYAN}$installed${NC}"
 
     log_step "Fetching available versions from GitLab..."
-    local latest
-    latest=$(get_latest_version)
-    local latest_stable
-    latest_stable=$(get_latest_version "stable")
+    load_tags
+    local latest latest_stable
+    latest=$(latest_version)
+    latest_stable=$(latest_stable_version)
 
     echo ""
-    echo -e "  Latest RC:     ${GREEN}$latest${NC}"
+    echo -e "  Latest:        ${GREEN}$latest${NC}"
     if [[ -n "$latest_stable" ]]; then
         echo -e "  Latest Stable: ${GREEN}$latest_stable${NC}"
     fi
 
     echo ""
     echo -e "${YELLOW}Available versions:${NC}"
-    get_available_versions | while read -r ver; do
+    sort_versions <<<"$TAGS" | tail -n 15 | tac | while read -r ver; do
         if [[ "$ver" == "$installed" ]]; then
             echo -e "  ${CYAN}► $ver${NC} (installed)"
         else
@@ -154,54 +178,77 @@ do_check() {
         echo -e "    ${CYAN}$0 upgrade${NC}           # Upgrade to $latest"
         echo -e "    ${CYAN}$0 upgrade <version>${NC} # Upgrade to specific version"
         echo ""
+    else
+        log_info "Installed version $installed is newer than the latest tag $latest"
     fi
 }
 
-# ============== BACKUP FUNCTION ==============
+# ============== UPGRADE STEPS ==============
 
+# Download a release into the staging dir and verify it, without touching the live install
+fetch_release() {
+    local version="$1" part
+    run_cmd_sudo "rm -rf $STAGING_DIR && mkdir -p $STAGING_DIR"
+
+    for part in api front; do
+        log_info "Downloading $part $version..."
+        if ! run_cmd_sudo "curl -fL --retry 3 -o $STAGING_DIR/$part.zip '$ARTIFACTS_URL/$version/download?job=build_$part' \
+                && unzip -tq $STAGING_DIR/$part.zip >/dev/null \
+                && unzip -q $STAGING_DIR/$part.zip -d $STAGING_DIR/$part-extracted \
+                && test -d $STAGING_DIR/$part-extracted/$part \
+                && rm $STAGING_DIR/$part.zip"; then
+            log_error "Download or verification of $part $version failed. Nothing was changed."
+            run_cmd_sudo "rm -rf $STAGING_DIR"
+            return 1
+        fi
+    done
+
+    log_info "Release $version downloaded and verified"
+}
+
+# Sets BACKUP_DIR. Returns non-zero on any failure.
 do_backup() {
     local version="$1"
     local with_db="${2:-false}"
-    local backup_dir="$BACKUP_BASE/upgrade-$(date +%Y%m%d_%H%M%S)"
+    BACKUP_DIR="$BACKUP_BASE/upgrade-$(date +%Y%m%d_%H%M%S)"
 
-    log_step "Creating backup in $backup_dir..."
+    log_step "Creating backup in $BACKUP_DIR..."
 
-    run_cmd_sudo "mkdir -p $backup_dir"
+    run_cmd_sudo "mkdir -p $BACKUP_DIR" || return 1
 
     # Optional database backup
     if [[ "$with_db" == "true" ]]; then
-        log_info "Backing up PostgreSQL database (this may take a moment)..."
-        run_cmd_sudo "sudo -u postgres pg_dumpall > $backup_dir/database.sql"
-        local db_size
-        db_size=$(run_cmd "ls -lh $backup_dir/database.sql | awk '{print \$5}'")
-        log_info "Database backup complete: $db_size"
+        log_info "Backing up PostgreSQL database $DB_NAME (this may take a moment)..."
+        run_cmd_sudo "sudo -u postgres pg_dump -Fc $DB_NAME > $BACKUP_DIR/database.dump && test -s $BACKUP_DIR/database.dump" || return 1
+        log_info "Database backup complete: $(run_cmd_sudo "du -h $BACKUP_DIR/database.dump | cut -f1")"
     fi
 
-    log_info "Backing up API..."
-    run_cmd_sudo "cp -a $FUNKWHALE_DIR/api $backup_dir/api"
-
-    log_info "Backing up frontend..."
-    run_cmd_sudo "cp -a $FUNKWHALE_DIR/front $backup_dir/front"
-
-    log_info "Backing up venv..."
-    run_cmd_sudo "cp -a $FUNKWHALE_DIR/venv $backup_dir/venv"
-
-    log_info "Backing up config..."
-    run_cmd_sudo "cp -a $FUNKWHALE_DIR/config $backup_dir/config"
+    log_info "Backing up API, frontend, venv and config..."
+    run_cmd_sudo "cp -a $FUNKWHALE_DIR/api $FUNKWHALE_DIR/front $FUNKWHALE_DIR/venv $FUNKWHALE_DIR/config $BACKUP_DIR/" || return 1
 
     log_info "Backing up systemd units..."
-    run_cmd_sudo "mkdir -p $backup_dir/systemd"
-    run_cmd_sudo "cp /etc/systemd/system/funkwhale*.service $backup_dir/systemd/ 2>/dev/null || true"
-    run_cmd_sudo "cp /etc/systemd/system/funkwhale.target $backup_dir/systemd/ 2>/dev/null || true"
+    run_cmd_sudo "mkdir -p $BACKUP_DIR/systemd && cp /etc/systemd/system/funkwhale*.service /etc/systemd/system/funkwhale.target $BACKUP_DIR/systemd/" || return 1
 
     # Save rollback info
-    run_cmd_sudo "bash -c 'echo \"$backup_dir\" > $ROLLBACK_MARKER'"
-    run_cmd_sudo "bash -c 'echo \"BACKUP_DATE=$(date)\" >> $ROLLBACK_MARKER'"
-    run_cmd_sudo "bash -c 'echo \"OLD_VERSION=$version\" >> $ROLLBACK_MARKER'"
-    run_cmd_sudo "bash -c 'echo \"WITH_DB=$with_db\" >> $ROLLBACK_MARKER'"
+    run_cmd_sudo "printf '%s\n' '$BACKUP_DIR' 'BACKUP_DATE=$(date)' 'OLD_VERSION=$version' 'WITH_DB=$with_db' > $ROLLBACK_MARKER" || return 1
 
-    log_info "Backup complete: $backup_dir"
-    echo "$backup_dir"
+    log_info "Backup complete: $BACKUP_DIR"
+}
+
+# Keep only the newest $KEEP_BACKUPS upgrade backups (names sort by date)
+prune_backups() {
+    (( KEEP_BACKUPS >= 1 )) || return 0
+    run_cmd_sudo "ls -1d $BACKUP_BASE/upgrade-* 2>/dev/null | sort -r | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -rf"
+}
+
+on_exit() {
+    local rc=$?
+    if [[ $rc -ne 0 && "$CHANGES_STARTED" == "true" ]]; then
+        log_error "Upgrade failed partway through. Restore the previous version with:"
+        log_error "  $0 rollback"
+        log_warn "Logs: $(journal_hint)"
+    fi
+    return $rc
 }
 
 # ============== UPGRADE COMMAND ==============
@@ -215,20 +262,26 @@ do_upgrade() {
         case "$1" in
             --with-db)
                 with_db="true"
-                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                return 1
                 ;;
             *)
-                if [[ -z "$target_version" ]]; then
-                    target_version="$1"
+                if [[ -n "$target_version" ]]; then
+                    log_error "Unexpected argument: $1"
+                    return 1
                 fi
-                shift
+                target_version="$1"
                 ;;
         esac
+        shift
     done
 
     # Default to latest if no version specified
     if [[ -z "$target_version" ]]; then
-        target_version=$(get_latest_version)
+        load_tags
+        target_version=$(latest_version)
     fi
 
     local installed
@@ -264,35 +317,35 @@ do_upgrade() {
         return 1
     fi
 
-    # Step 1: Stop services
+    trap on_exit EXIT
+
+    # Step 1: Download and verify while the old version keeps running
+    log_step "Downloading Funkwhale $target_version..."
+    fetch_release "$target_version"
+
+    # Step 2: Stop services
     log_step "Stopping Funkwhale services..."
     run_cmd_sudo "systemctl stop funkwhale.target" || true
     sleep 2
 
-    # Step 2: Create backup (with optional database)
+    # Step 3: Create backup (with optional database)
     log_step "Creating backup..."
-    local backup_dir
-    backup_dir=$(do_backup "$installed" "$with_db")
-    run_cmd_sudo "bash -c 'echo \"NEW_VERSION=$target_version\" >> $ROLLBACK_MARKER'"
+    if ! do_backup "$installed" "$with_db"; then
+        log_error "Backup failed. Nothing was changed; restarting services."
+        run_cmd_sudo "rm -rf $STAGING_DIR"
+        run_cmd_sudo "systemctl start funkwhale.target"
+        return 1
+    fi
+    run_cmd_sudo "echo 'NEW_VERSION=$target_version' >> $ROLLBACK_MARKER"
+    prune_backups
 
-    # Step 3: Download new version
-    log_step "Downloading Funkwhale $target_version..."
-
-    run_cmd_sudo "bash -c 'cd $FUNKWHALE_DIR && curl -L -o api-$target_version.zip \"https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts/$target_version/download?job=build_api\"'"
-    run_cmd_sudo "bash -c 'cd $FUNKWHALE_DIR && curl -L -o front-$target_version.zip \"https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts/$target_version/download?job=build_front\"'"
-
-    # Step 4: Extract files
+    # Step 4: Swap in the new release
     log_step "Installing new version..."
-
-    # Clean old files
-    run_cmd_sudo "rm -rf $FUNKWHALE_DIR/api/*"
-    run_cmd_sudo "rm -rf $FUNKWHALE_DIR/front/*"
-
-    # Extract API
-    run_cmd_sudo "bash -c 'cd $FUNKWHALE_DIR && unzip -q api-$target_version.zip -d extracted && mv extracted/api/* api/ && rm -rf extracted api-$target_version.zip'"
-
-    # Extract frontend
-    run_cmd_sudo "bash -c 'cd $FUNKWHALE_DIR && unzip -q front-$target_version.zip -d extracted && mv extracted/front/* front/ && rm -rf extracted front-$target_version.zip'"
+    CHANGES_STARTED=true
+    run_cmd_sudo "rm -rf $FUNKWHALE_DIR/api $FUNKWHALE_DIR/front \
+        && mv $STAGING_DIR/api-extracted/api $FUNKWHALE_DIR/api \
+        && mv $STAGING_DIR/front-extracted/front $FUNKWHALE_DIR/front \
+        && rm -rf $STAGING_DIR"
 
     # Step 5: Update venv
     log_step "Updating Python environment..."
@@ -307,8 +360,8 @@ do_upgrade() {
 
     # Step 7: Run migrations (must run from api directory due to troi library)
     log_step "Running database migrations..."
-    run_cmd_sudo "bash -c 'cd $FUNKWHALE_DIR/api && sudo -u funkwhale $FUNKWHALE_DIR/venv/bin/funkwhale-manage collectstatic --no-input'"
-    run_cmd_sudo "bash -c 'cd $FUNKWHALE_DIR/api && sudo -u funkwhale $FUNKWHALE_DIR/venv/bin/funkwhale-manage migrate'"
+    run_cmd_sudo "cd $FUNKWHALE_DIR/api && sudo -u funkwhale $FUNKWHALE_DIR/venv/bin/funkwhale-manage collectstatic --no-input"
+    run_cmd_sudo "cd $FUNKWHALE_DIR/api && sudo -u funkwhale $FUNKWHALE_DIR/venv/bin/funkwhale-manage migrate"
 
     # Step 8: Start services
     log_step "Starting services..."
@@ -319,13 +372,9 @@ do_upgrade() {
 
     # Step 9: Verify
     log_step "Verifying upgrade..."
-    local new_version
-    new_version=$(get_installed_version)
-
     if run_cmd_sudo "systemctl is-active --quiet funkwhale-server.service"; then
         # Save the installed version to marker file
-        run_cmd_sudo "bash -c 'echo \"$target_version\" > $VERSION_MARKER'"
-        run_cmd_sudo "chown funkwhale:funkwhale $VERSION_MARKER"
+        run_cmd_sudo "echo '$target_version' > $VERSION_MARKER && chown funkwhale:funkwhale $VERSION_MARKER"
 
         echo ""
         echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
@@ -338,8 +387,6 @@ do_upgrade() {
         echo ""
     else
         log_error "Services failed to start!"
-        log_warn "Check logs with: ssh $SSH_HOST journalctl -u funkwhale-server -n 50"
-        log_warn "To rollback: $0 rollback"
         return 1
     fi
 }
@@ -362,7 +409,7 @@ do_rollback() {
     local backup_dir
     backup_dir=$(run_cmd "head -1 $ROLLBACK_MARKER")
     local old_version
-    old_version=$(run_cmd "grep OLD_VERSION $ROLLBACK_MARKER | cut -d= -f2")
+    old_version=$(run_cmd "sed -n 's/^OLD_VERSION=//p' $ROLLBACK_MARKER")
 
     echo -e "  Backup location: ${CYAN}$backup_dir${NC}"
     echo -e "  Rolling back to: ${YELLOW}$old_version${NC}"
@@ -379,31 +426,46 @@ do_rollback() {
     log_step "Stopping services..."
     run_cmd_sudo "systemctl stop funkwhale.target" || true
 
-    # Restore files
+    # Restore files (backups made by migrate-v1-to-v2.sh hold a v1 virtualenv instead of venv)
     log_step "Restoring files from backup..."
-    run_cmd_sudo "rm -rf $FUNKWHALE_DIR/api $FUNKWHALE_DIR/front $FUNKWHALE_DIR/venv"
+    run_cmd_sudo "rm -rf $FUNKWHALE_DIR/api $FUNKWHALE_DIR/front $FUNKWHALE_DIR/venv $FUNKWHALE_DIR/virtualenv"
     run_cmd_sudo "cp -a $backup_dir/api $FUNKWHALE_DIR/api"
     run_cmd_sudo "cp -a $backup_dir/front $FUNKWHALE_DIR/front"
-    run_cmd_sudo "cp -a $backup_dir/venv $FUNKWHALE_DIR/venv"
+    run_cmd_sudo "if [ -d $backup_dir/venv ]; then cp -a $backup_dir/venv $FUNKWHALE_DIR/venv; else cp -a $backup_dir/virtualenv $FUNKWHALE_DIR/virtualenv; fi"
+    if run_cmd "test -d $backup_dir/config"; then
+        run_cmd_sudo "rm -rf $FUNKWHALE_DIR/config && cp -a $backup_dir/config $FUNKWHALE_DIR/config"
+    fi
 
     # Restore systemd units
     log_step "Restoring systemd units..."
     run_cmd_sudo "cp $backup_dir/systemd/* /etc/systemd/system/"
     run_cmd_sudo "systemctl daemon-reload"
 
+    # Backups made by upgrade.sh also hold nginx files, stored under their full paths
+    if run_cmd "test -d $backup_dir/nginx-files"; then
+        log_step "Restoring nginx config..."
+        run_cmd_sudo "cd $backup_dir/nginx-files && find . -type f | while read -r f; do cp -a \"\$f\" \"/\${f#./}\"; done"
+        run_cmd_sudo "nginx -t && systemctl reload nginx" || log_warn "Restored nginx config failed 'nginx -t'; nginx was not reloaded"
+    fi
+
     # Check if database backup exists and offer to restore
-    if run_cmd "test -f $backup_dir/database.sql" 2>/dev/null; then
+    if run_cmd "test -f $backup_dir/database.dump" 2>/dev/null; then
         echo ""
-        log_warn "Database backup found: $backup_dir/database.sql"
+        log_warn "Database backup found: $backup_dir/database.dump"
         read -p "Restore database? This will OVERWRITE current data! [y/N] " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             log_step "Restoring PostgreSQL database..."
-            run_cmd_sudo "sudo -u postgres psql < $backup_dir/database.sql"
+            run_cmd_sudo "sudo -u postgres pg_restore --clean --if-exists -d $DB_NAME < $backup_dir/database.dump"
             log_info "Database restored"
         else
             log_info "Database NOT restored (kept current data)"
         fi
+    elif run_cmd "test -f $backup_dir/database.sql" 2>/dev/null; then
+        # Backups made by older versions of this script used pg_dumpall
+        log_warn "This backup has a pg_dumpall file. Restore it manually (services stopped) with:"
+        log_warn "  sudo -u postgres dropdb $DB_NAME"
+        log_warn "  sudo -u postgres psql -f $backup_dir/database.sql postgres"
     fi
 
     # Start services
@@ -414,7 +476,11 @@ do_rollback() {
 
     if run_cmd_sudo "systemctl is-active --quiet funkwhale-server.service"; then
         # Restore version marker
-        run_cmd_sudo "bash -c 'echo \"$old_version\" > $VERSION_MARKER'"
+        if [[ -n "$old_version" && "$old_version" != "unknown" ]]; then
+            run_cmd_sudo "echo '$old_version' > $VERSION_MARKER"
+        else
+            run_cmd_sudo "rm -f $VERSION_MARKER"
+        fi
 
         echo ""
         echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
@@ -424,6 +490,7 @@ do_rollback() {
         echo ""
     else
         log_error "Services failed to start after rollback"
+        log_warn "Logs: $(journal_hint)"
         return 1
     fi
 }
@@ -475,7 +542,8 @@ main() {
             do_check
             ;;
         upgrade)
-            do_upgrade "${2:-}"
+            shift
+            do_upgrade "$@"
             ;;
         rollback)
             do_rollback
@@ -500,12 +568,16 @@ main() {
             echo "Options:"
             echo "  --with-db          Also backup PostgreSQL database before upgrade"
             echo ""
+            echo "Environment:"
+            echo "  SSH_HOST           Run against this host over SSH instead of locally"
+            echo ""
             echo "Examples:"
             echo "  $0 check"
             echo "  $0 upgrade                      # Latest version, code backup only"
             echo "  $0 upgrade --with-db            # Latest version + database backup"
             echo "  $0 upgrade 2.0.0-rc13           # Specific version"
             echo "  $0 upgrade 2.0.0-rc13 --with-db # Specific version + database backup"
+            echo "  SSH_HOST=myserver $0 check      # Remote server"
             echo ""
             ;;
     esac

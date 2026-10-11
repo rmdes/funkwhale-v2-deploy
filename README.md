@@ -13,9 +13,8 @@ For those who prefer to set things up by hand or already have a running instance
 **What's included:**
 
 - `config/.env.example` - Funkwhale environment configuration template
-- `config/nginx/` - nginx site and proxy configuration
+- `config/nginx/` - nginx site and proxy configuration, plus an HTTP-only site used to get the first certificate
 - `config/systemd/` - systemd service units (server, worker, beat, target)
-- `config/logrotate/` - log rotation config
 - `scripts/upgrade.sh` - upgrade script with rollback support
 
 **Quick start:**
@@ -36,33 +35,47 @@ sudo nano /srv/funkwhale/config/.env   # Set your domain + generate secret key
 # 4. Download and install Funkwhale (replace version as needed)
 VERSION="2.0.0-rc15"
 cd /srv/funkwhale
-sudo -u funkwhale curl -L -o api.zip \
+sudo -u funkwhale curl -fL -o api.zip \
   "https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts/$VERSION/download?job=build_api"
-sudo -u funkwhale curl -L -o front.zip \
+sudo -u funkwhale curl -fL -o front.zip \
   "https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts/$VERSION/download?job=build_front"
 sudo -u funkwhale unzip api.zip && sudo -u funkwhale unzip front.zip
-rm api.zip front.zip
+sudo rm api.zip front.zip
+sudo -u funkwhale mkdir -p data/media data/music data/static
 
 # 5. Set up Python venv and install
 sudo -u funkwhale python3 -m venv /srv/funkwhale/venv
 sudo -u funkwhale /srv/funkwhale/venv/bin/pip install --upgrade pip wheel
 sudo -u funkwhale /srv/funkwhale/venv/bin/pip install --editable ./api
 
-# 6. Run initial setup
+# 6. Run initial setup (from api/, the services' working directory)
+cd /srv/funkwhale/api
 sudo -u funkwhale /srv/funkwhale/venv/bin/funkwhale-manage collectstatic --no-input
 sudo -u funkwhale /srv/funkwhale/venv/bin/funkwhale-manage migrate
 sudo -u funkwhale /srv/funkwhale/venv/bin/funkwhale-manage createsuperuser
+cd -   # back to this repo
 
 # 7. Deploy service configs
 sudo cp config/systemd/* /etc/systemd/system/
 sudo cp config/nginx/funkwhale_proxy.conf /etc/nginx/
-# Edit config/nginx/funkwhale.conf - replace YOUR_DOMAIN with your domain
-sudo cp config/nginx/funkwhale.conf /etc/nginx/sites-available/your-domain.conf
-sudo ln -s /etc/nginx/sites-available/your-domain.conf /etc/nginx/sites-enabled/
-sudo cp config/logrotate/funkwhale /etc/logrotate.d/
 
-# 8. Get SSL certificate and start
-sudo certbot --nginx -d your-domain.example.com
+# 8. Get the TLS certificate. The full site config needs the certificate to exist,
+#    so start with an HTTP-only site for the challenge.
+DOMAIN="your-domain.example.com"
+sed "s/YOUR_DOMAIN/$DOMAIN/g" config/nginx/funkwhale_bootstrap.conf \
+  | sudo tee /etc/nginx/sites-available/$DOMAIN.conf >/dev/null
+sudo ln -s /etc/nginx/sites-available/$DOMAIN.conf /etc/nginx/sites-enabled/
+sudo systemctl reload nginx
+sudo certbot certonly --nginx -d $DOMAIN
+# Reload nginx after each automatic renewal (certbot.timer handles renewals)
+printf '#!/bin/sh\nsystemctl reload nginx\n' \
+  | sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh >/dev/null
+sudo chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+
+# 9. Install the full site config and start
+sed "s/YOUR_DOMAIN/$DOMAIN/g" config/nginx/funkwhale.conf \
+  | sudo tee /etc/nginx/sites-available/$DOMAIN.conf >/dev/null
+sudo nginx -t
 sudo systemctl daemon-reload
 sudo systemctl enable --now funkwhale.target
 sudo systemctl reload nginx
@@ -95,7 +108,9 @@ nano group_vars/all.yml   # Set domain, email, version
 ansible-playbook -i inventory playbook.yml
 ```
 
-**Variables reference:**
+The playbook is safe to re-run: the Django secret key is read back from the existing `.env` and only generated on first deploy. On first deploy it serves an HTTP-only site to obtain the certificate, then installs the full config. Renewals are handled by `certbot.timer`, with a deploy hook that reloads nginx.
+
+**Variables reference** (defaults live in `roles/funkwhale/defaults/main.yml`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -103,8 +118,15 @@ ansible-playbook -i inventory playbook.yml
 | `certbot_email` | (required) | Email for Let's Encrypt |
 | `funkwhale_version` | `2.0.0-rc15` | Funkwhale version to deploy |
 | `funkwhale_web_workers` | `4` | Gunicorn worker count |
+| `funkwhale_api_ip` | `127.0.0.1` | API listening address |
 | `funkwhale_api_port` | `5000` | API listening port |
-| `funkwhale_fresh_install` | `true` | Set to `false` for upgrades |
+| `funkwhale_dir` | `/srv/funkwhale` | Install directory |
+| `funkwhale_data_dir` | `{{ funkwhale_dir }}/data` | Media, music and static files |
+| `nginx_max_body_size` | `2000M` | Upload size limit |
+| `funkwhale_fresh_install` | `true` | Create the admin account (harmless if it already exists) |
+| `funkwhale_admin_username` | `admin` | Admin account name |
+| `funkwhale_admin_email` | `{{ certbot_email }}` | Admin account email |
+| `funkwhale_admin_password` | `""` | Admin password; if empty, set it later with `funkwhale-manage changepassword` |
 
 ## Migrating from Funkwhale 1.x
 
@@ -118,17 +140,19 @@ sudo bash scripts/migrate-v1-to-v2.sh status
 sudo systemctl stop funkwhale.target
 
 # Run the migration (backs up everything, then upgrades)
-sudo bash scripts/migrate-v1-to-v2.sh upgrade
+sudo bash scripts/migrate-v1-to-v2.sh upgrade --with-db
 
 # If something goes wrong
 sudo bash scripts/migrate-v1-to-v2.sh rollback
 ```
 
-This handles the full v1→v2 transition: backing up the old `virtualenv`, creating a new `venv`, downloading v2 artifacts, updating systemd units and nginx config, and running database migrations.
+This handles the full v1→v2 transition: backing up the old `virtualenv`, creating a new `venv`, downloading v2 artifacts, installing the systemd units and nginx config from this repo, and running database migrations. It writes the v2 nginx site over the site config currently in use (or creates `<hostname>.conf`).
+
+It migrates to `2.0.0-rc5`, the release it was tested with. Pass another version to override (`upgrade 2.0.0-rc15`), or migrate to rc5 and then use the updater below.
 
 ## Upgrading between v2 releases
 
-For ongoing upgrades (e.g., between release candidates), use the updater:
+For ongoing upgrades (e.g., between release candidates), use the updater. It runs on the server with sudo, or from another machine over SSH:
 
 ```bash
 # Check for available updates
@@ -142,18 +166,23 @@ For ongoing upgrades (e.g., between release candidates), use the updater:
 
 # If something goes wrong
 ./scripts/funkwhale-updater.sh rollback
+
+# Run any of these against a remote server
+SSH_HOST=my-server ./scripts/funkwhale-updater.sh check
 ```
 
-The updater queries the Funkwhale GitLab API for available versions and handles the full lifecycle: stop → backup → download → install → migrate → start → verify.
+The updater queries the Funkwhale GitLab API for available versions and handles the full lifecycle: download and verify → stop → backup → install → migrate → start → verify. The new release is downloaded and checked while the old version is still running, so a failed download changes nothing. If the backup fails, services are restarted and nothing is changed.
 
-You can also use the simpler upgrade script:
+You can also use the simpler upgrade script, which also reinstalls the systemd units and nginx proxy config from this repo (run it from a checkout of the repo):
 
 ```bash
 sudo bash scripts/upgrade.sh status
 sudo systemctl stop funkwhale.target
-sudo bash scripts/upgrade.sh upgrade 2.0.0-rc15
+sudo bash scripts/upgrade.sh upgrade 2.0.0-rc15 --with-db
 sudo bash scripts/upgrade.sh rollback  # if needed
 ```
+
+**Backups and rollback:** each upgrade stores a backup in `/srv/funkwhale/backups/upgrade-<date>/` (code, venv, config, systemd units, nginx files and, with `--with-db`, a `pg_dump -Fc` database dump). Only the newest 3 are kept; set `KEEP_BACKUPS` to change that. Rollback restores all of it and offers to restore the database with `pg_restore --clean`. All three scripts share the same rollback record, so any of them can roll back an upgrade made by another.
 
 ## Architecture
 

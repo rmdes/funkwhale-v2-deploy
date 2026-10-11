@@ -1,0 +1,28 @@
+---
+# Required, no default: funkwhale_hostname, certbot_email
+
+funkwhale_version: "2.0.0-rc15"
+
+# Application settings
+funkwhale_api_port: 5000
+funkwhale_api_ip: "127.0.0.1"
+funkwhale_web_workers: 4
+funkwhale_protocol: https
+celery_concurrency: 0
+nginx_max_body_size: "2000M"
+
+# Paths
+funkwhale_dir: /srv/funkwhale
+funkwhale_data_dir: "{{ funkwhale_dir }}/data"
+
+# Database
+funkwhale_db_name: funkwhale
+funkwhale_db_user: funkwhale
+
+# Create the admin account on this run
+funkwhale_fresh_install: true
+funkwhale_admin_username: admin
+funkwhale_admin_email: "{{ certbot_email }}"
+# Leave empty to create the account without a password and set one later
+# with: funkwhale-manage changepassword <username>
+funkwhale_admin_password: ""
