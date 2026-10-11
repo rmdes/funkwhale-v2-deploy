@@ -13,6 +13,7 @@ VERSION_MARKER="$FUNKWHALE_DIR/.installed_version"
 STAGING_DIR="$FUNKWHALE_DIR/.upgrade-staging"
 KEEP_BACKUPS="${KEEP_BACKUPS:-3}"
 DB_NAME="${DB_NAME:-funkwhale}"
+DB_USER="${DB_USER:-funkwhale}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 NGINX_DIR="${NGINX_DIR:-/etc/nginx}"
 ARTIFACTS_URL="${ARTIFACTS_URL:-https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts}"
@@ -119,7 +120,24 @@ fetch_release() {
         rm "$STAGING_DIR/$part.zip"
     done
 
+    check_python_version "$STAGING_DIR/api-extracted/api/pyproject.toml"
+
     log_info "Release $version downloaded and verified"
+}
+
+# Fail before touching anything if python3 is older than the release requires.
+# pyproject.toml declares e.g.  python = "^3.12, <3.15"
+check_python_version() {
+    local required have
+    required=$(sed -nE 's/^python *= *"[\^>=~ ]*([0-9]+\.[0-9]+).*/\1/p' "$1" 2>/dev/null | head -n 1)
+    [[ -n "$required" ]] || return 0
+    have=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+    if [[ "$(printf '%s\n' "$required" "$have" | sort -V | head -n 1)" != "$required" ]]; then
+        log_error "This release needs Python >= $required, but python3 is $have. Nothing was changed."
+        log_error "Upgrade the OS (Debian 13 / Ubuntu 24.04) or use the Docker deployment."
+        rm -rf "$STAGING_DIR"
+        exit 1
+    fi
 }
 
 backup_database() {
@@ -215,6 +233,16 @@ on_exit() {
     return $rc
 }
 
+# Install the OS packages the release needs, as the upstream upgrade guide does
+install_os_dependencies() {
+    if [[ -f "$FUNKWHALE_DIR/api/install_os_dependencies.sh" ]]; then
+        log_info "Installing OS dependencies..."
+        bash "$FUNKWHALE_DIR/api/install_os_dependencies.sh" install
+    else
+        log_warn "api/install_os_dependencies.sh not found in this release; skipping OS dependencies"
+    fi
+}
+
 # Swap the staged release into place and rebuild the Python environment
 install_release() {
     log_info "Installing new API and frontend..."
@@ -223,6 +251,8 @@ install_release() {
     mv "$STAGING_DIR/api-extracted/api" "$FUNKWHALE_DIR/api"
     mv "$STAGING_DIR/front-extracted/front" "$FUNKWHALE_DIR/front"
     rm -rf "$STAGING_DIR"
+
+    install_os_dependencies
 
     # Funkwhale v2 uses venv instead of virtualenv
     log_info "Creating new Python virtual environment..."
@@ -330,9 +360,13 @@ restore_database() {
         read -p "Restore database? This will OVERWRITE current data! [y/N] " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
+            # Recreate the database rather than pg_restore --clean: objects added by the
+            # newer migrations aren't in the dump and would block dropping the old ones
             log_info "Restoring PostgreSQL database..."
+            sudo -u postgres dropdb --force "$DB_NAME"
+            sudo -u postgres createdb -O "$DB_USER" "$DB_NAME"
             # shellcheck disable=SC2024  # root reads the dump; postgres gets it on stdin
-            sudo -u postgres pg_restore --clean --if-exists -d "$DB_NAME" < "$BACKUP_DIR/database.dump"
+            sudo -u postgres pg_restore -d "$DB_NAME" < "$BACKUP_DIR/database.dump"
             log_info "Database restored"
         else
             log_info "Database NOT restored (kept current data)"

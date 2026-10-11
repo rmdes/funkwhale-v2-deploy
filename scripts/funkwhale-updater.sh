@@ -19,10 +19,13 @@ FUNKWHALE_DIR="${FUNKWHALE_DIR:-/srv/funkwhale}"
 BACKUP_BASE="$FUNKWHALE_DIR/backups"
 GITLAB_API="${GITLAB_API:-https://dev.funkwhale.audio/api/v4/projects/funkwhale%2Ffunkwhale}"
 ARTIFACTS_URL="${ARTIFACTS_URL:-https://dev.funkwhale.audio/funkwhale/funkwhale/-/jobs/artifacts}"
+# Fallback version source when the GitLab API is down: release images share the release tags
+DOCKERHUB_TAGS="${DOCKERHUB_TAGS:-https://hub.docker.com/v2/repositories/funkwhale/api/tags}"
 ROLLBACK_MARKER="$BACKUP_BASE/.rollback_info"
 VERSION_MARKER="$FUNKWHALE_DIR/.installed_version"
 STAGING_DIR="$FUNKWHALE_DIR/.upgrade-staging"
 DB_NAME="${DB_NAME:-funkwhale}"
+DB_USER="${DB_USER:-funkwhale}"
 KEEP_BACKUPS="${KEEP_BACKUPS:-3}"
 
 # Set to your server's SSH alias/hostname, or leave empty to run locally
@@ -100,6 +103,14 @@ fetch_tags() {
     jq -r '.[].name' <<<"$json" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || true
 }
 
+# Same, from the funkwhale/api image tags on Docker Hub. Skips aliases (latest, 2, 2.0)
+# and the -legacycpu image variants.
+fetch_tags_dockerhub() {
+    local json
+    json=$(curl -fsS --max-time 30 "${DOCKERHUB_TAGS}?page_size=100&ordering=last_updated") || return 1
+    jq -r '.results[].name' <<<"$json" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' | grep -v -- '-legacycpu$' || true
+}
+
 # Sort versions ascending; a pre-release (2.0.0-rc15) sorts below its release (2.0.0)
 sort_versions() {
     sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1.1 \1/; s/^([0-9]+\.[0-9]+\.[0-9]+)-(.+)$/\1.0-\2 \1-\2/' |
@@ -112,10 +123,16 @@ version_gt() {
 }
 
 load_tags() {
-    if ! TAGS=$(fetch_tags) || [[ -z "$TAGS" ]]; then
-        log_error "Could not fetch release tags from $GITLAB_API"
-        exit 1
+    if TAGS=$(fetch_tags) && [[ -n "$TAGS" ]]; then
+        return
     fi
+    log_warn "GitLab API unavailable; reading versions from Docker Hub image tags instead"
+    log_warn "(installing still downloads release artifacts from GitLab)"
+    if TAGS=$(fetch_tags_dockerhub) && [[ -n "$TAGS" ]]; then
+        return
+    fi
+    log_error "Could not fetch release tags from GitLab or Docker Hub"
+    exit 1
 }
 
 latest_version() {
@@ -203,7 +220,26 @@ fetch_release() {
         fi
     done
 
+    if ! check_python_version "$STAGING_DIR/api-extracted/api/pyproject.toml"; then
+        run_cmd_sudo "rm -rf $STAGING_DIR"
+        return 1
+    fi
+
     log_info "Release $version downloaded and verified"
+}
+
+# Fail if the host's python3 is older than the release requires.
+# pyproject.toml declares e.g.  python = "^3.12, <3.15"
+check_python_version() {
+    local required have
+    required=$(run_cmd "sed -nE 's/^python *= *\"[\\^>=~ ]*([0-9]+\\.[0-9]+).*/\\1/p' $1 2>/dev/null | head -n 1" || true)
+    [[ -n "$required" ]] || return 0
+    have=$(run_cmd "python3 -c 'import sys; print(\"%d.%d\" % sys.version_info[:2])'")
+    if [[ "$(printf '%s\n' "$required" "$have" | sort -V | head -n 1)" != "$required" ]]; then
+        log_error "This release needs Python >= $required, but the host has $have. Nothing was changed."
+        log_error "Upgrade the OS (Debian 13 / Ubuntu 24.04) or use the Docker deployment."
+        return 1
+    fi
 }
 
 # Sets BACKUP_DIR. Returns non-zero on any failure.
@@ -347,6 +383,14 @@ do_upgrade() {
         && mv $STAGING_DIR/front-extracted/front $FUNKWHALE_DIR/front \
         && rm -rf $STAGING_DIR"
 
+    # OS packages the release needs, as the upstream upgrade guide does
+    log_step "Installing OS dependencies..."
+    if run_cmd "test -f $FUNKWHALE_DIR/api/install_os_dependencies.sh"; then
+        run_cmd_sudo "bash $FUNKWHALE_DIR/api/install_os_dependencies.sh install"
+    else
+        log_warn "api/install_os_dependencies.sh not found in this release; skipping"
+    fi
+
     # Step 5: Update venv
     log_step "Updating Python environment..."
     run_cmd_sudo "rm -rf $FUNKWHALE_DIR/venv"
@@ -456,7 +500,9 @@ do_rollback() {
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             log_step "Restoring PostgreSQL database..."
-            run_cmd_sudo "sudo -u postgres pg_restore --clean --if-exists -d $DB_NAME < $backup_dir/database.dump"
+            # Recreate the database rather than pg_restore --clean: objects added by the
+            # newer migrations aren't in the dump and would block dropping the old ones
+            run_cmd_sudo "sudo -u postgres dropdb --force $DB_NAME && sudo -u postgres createdb -O $DB_USER $DB_NAME && sudo -u postgres pg_restore -d $DB_NAME < $backup_dir/database.dump"
             log_info "Database restored"
         else
             log_info "Database NOT restored (kept current data)"
@@ -561,7 +607,7 @@ main() {
             echo "Commands:"
             echo "  check              Check for available updates"
             echo "  upgrade            Upgrade to latest version"
-            echo "  upgrade <version>  Upgrade to specific version (e.g., 2.0.0-rc13)"
+            echo "  upgrade <version>  Upgrade to specific version (e.g., 2.0.11)"
             echo "  rollback           Rollback to previous version"
             echo "  status             Show current installation status"
             echo ""
@@ -575,8 +621,8 @@ main() {
             echo "  $0 check"
             echo "  $0 upgrade                      # Latest version, code backup only"
             echo "  $0 upgrade --with-db            # Latest version + database backup"
-            echo "  $0 upgrade 2.0.0-rc13           # Specific version"
-            echo "  $0 upgrade 2.0.0-rc13 --with-db # Specific version + database backup"
+            echo "  $0 upgrade 2.0.11               # Specific version"
+            echo "  $0 upgrade 2.0.11 --with-db     # Specific version + database backup"
             echo "  SSH_HOST=myserver $0 check      # Remote server"
             echo ""
             ;;

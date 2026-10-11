@@ -1,7 +1,7 @@
 ---
 # Required, no default: funkwhale_hostname, certbot_email
 
-funkwhale_version: "2.0.0-rc15"
+funkwhale_version: "2.0.11"
 
 # Application settings
 funkwhale_api_port: 5000
@@ -21,8 +21,8 @@ funkwhale_db_user: funkwhale
 
 # Create the admin account on this run
 funkwhale_fresh_install: true
-funkwhale_admin_username: admin
+# "admin", "root", "test" and similar are reserved by Funkwhale
+funkwhale_admin_username: "{{ certbot_email.split('@')[0] | regex_replace('[^A-Za-z0-9_]', '') }}"
 funkwhale_admin_email: "{{ certbot_email }}"
-# Leave empty to create the account without a password and set one later
-# with: funkwhale-manage changepassword <username>
+# Leave empty to have a random password generated and shown once
 funkwhale_admin_password: ""

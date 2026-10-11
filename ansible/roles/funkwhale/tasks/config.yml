@@ -143,25 +143,53 @@
   register: migrate_output
   changed_when: "'No migrations to apply' not in migrate_output.stdout"
 
+# Funkwhale 2.0 refuses Django's createsuperuser; use its own command.
+# It prompts when no password is given, so always pass one.
+- name: Generate admin password
+  command: python3 -c "import secrets; print(secrets.token_hex(12))"
+  register: generated_admin_password
+  when: funkwhale_fresh_install and not funkwhale_admin_password
+  changed_when: false
+  no_log: true
+
 - name: Create admin user
-  command: >
-    {{ funkwhale_dir }}/venv/bin/funkwhale-manage createsuperuser
-    --noinput --username {{ funkwhale_admin_username }} --email {{ funkwhale_admin_email }}
+  command:
+    argv:
+      - "{{ funkwhale_dir }}/venv/bin/funkwhale-manage"
+      - fw
+      - users
+      - create
+      - --superuser
+      - --username
+      - "{{ funkwhale_admin_username }}"
+      - --email
+      - "{{ funkwhale_admin_email }}"
+      - --password
+      - "{{ funkwhale_admin_password or generated_admin_password.stdout }}"
   become_user: funkwhale
   args:
     chdir: "{{ funkwhale_dir }}/api"
-  environment: "{{ {'DJANGO_SUPERUSER_PASSWORD': funkwhale_admin_password} if funkwhale_admin_password else {} }}"
-  register: createsuperuser
-  changed_when: createsuperuser.rc == 0
-  failed_when: createsuperuser.rc != 0 and 'already taken' not in createsuperuser.stderr
+  register: create_admin
+  changed_when: create_admin.rc == 0
+  failed_when: false
   when: funkwhale_fresh_install
+  no_log: true  # the password is on the command line
 
-- name: Remind to set the admin password
-  debug:
-    msg: >-
-      Admin user '{{ funkwhale_admin_username }}' was created without a password. Set one with:
-      sudo -u funkwhale {{ funkwhale_dir }}/venv/bin/funkwhale-manage changepassword {{ funkwhale_admin_username }}
+# Reports the command's own output, which doesn't contain the password
+- name: Check admin user creation
+  fail:
+    msg: "Creating admin user '{{ funkwhale_admin_username }}' failed: {{ create_admin.stdout }} {{ create_admin.stderr }}"
   when:
     - funkwhale_fresh_install
-    - createsuperuser is changed
+    - create_admin.rc != 0
+    - "'already exists' not in (create_admin.stdout ~ create_admin.stderr)"
+
+- name: Show the generated admin password
+  debug:
+    msg: >-
+      Admin user '{{ funkwhale_admin_username }}' created with password
+      {{ generated_admin_password.stdout }} (shown only once; change it after logging in)
+  when:
+    - funkwhale_fresh_install
+    - create_admin is changed
     - not funkwhale_admin_password

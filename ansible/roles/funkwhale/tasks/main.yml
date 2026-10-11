@@ -6,6 +6,16 @@
       - certbot_email is defined and certbot_email | length > 0
     fail_msg: "Set funkwhale_hostname and certbot_email (see group_vars/all.yml.example)"
 
+- name: Check the target's Python is new enough for Funkwhale 2.0.x
+  assert:
+    that:
+      - ansible_facts.python.version.major == 3
+      - ansible_facts.python.version.minor >= 12
+    fail_msg: >-
+      Funkwhale 2.0.x needs Python >= 3.12, the target has
+      {{ ansible_facts.python.version.major }}.{{ ansible_facts.python.version.minor }}.
+      Use Debian 13+ or Ubuntu 24.04+.
+
 - name: Install system dependencies
   import_tasks: dependencies.yml
 

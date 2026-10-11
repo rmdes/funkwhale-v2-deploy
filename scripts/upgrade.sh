@@ -4,7 +4,7 @@
 # Upgrades between Funkwhale v2 releases with rollback capability.
 #
 # Usage:
-#   ./upgrade.sh upgrade <version> [--with-db]   e.g. ./upgrade.sh upgrade 2.0.0-rc15
+#   ./upgrade.sh upgrade <version> [--with-db]   e.g. ./upgrade.sh upgrade 2.0.11
 #   ./upgrade.sh rollback
 #   ./upgrade.sh status
 #
@@ -31,7 +31,7 @@ do_upgrade() {
 
     if [[ -z "$FUNKWHALE_VERSION" ]]; then
         log_error "Usage: $0 upgrade <version> [--with-db]"
-        log_error "  e.g. $0 upgrade 2.0.0-rc15"
+        log_error "  e.g. $0 upgrade 2.0.11"
         exit 1
     fi
 
@@ -82,7 +82,7 @@ case "${1:-}" in
         echo "Usage: $0 <command> [version] [--with-db]"
         echo ""
         echo "Commands:"
-        echo "  upgrade <version>  - Upgrade Funkwhale (e.g. $0 upgrade 2.0.0-rc15)"
+        echo "  upgrade <version>  - Upgrade Funkwhale (e.g. $0 upgrade 2.0.11)"
         echo "  rollback           - Rollback to previous version"
         echo "  status             - Show current installation status"
         echo ""
